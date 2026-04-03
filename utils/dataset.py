@@ -200,6 +200,52 @@ class Dataset(object):
                 self.trace_graphs_GAE.append(
                     Data(torch.tensor(np.array(node), dtype=torch.float), edge_index=edge_index.T, edge_attr=edge_attr))
 
+    def _gen_patches(self, window_size):
+        """Precompute sliding-window patches for PatchBPAD.
+
+        Stores on *self*:
+            window_size   – the window (patch) width w
+            patches       – list of K arrays (N, num_patches, w)  target / encoder patches
+            decoder_patches – list of K arrays (N, num_patches, w)  shifted decoder-input patches
+            teacher_tokens  – list of K arrays (N, num_patches)    teacher-forcing tokens
+            patch_mask      – bool array (N, num_patches, w)       True where token is padding
+        """
+        w = window_size
+        self.window_size = w
+
+        N = self.num_cases
+        T = self.max_len
+        num_patches = T - w + 1
+
+        self.patches = []
+        self.decoder_patches = []
+        self.teacher_tokens = []
+
+        for k in range(self.num_attributes):
+            feat = self.features[k]  # (N, T)
+
+            # --- target / encoder patches: sliding window on feat ---
+            # Build index array for gathering: shape (num_patches, w)
+            idx = np.arange(w)[None, :] + np.arange(num_patches)[:, None]  # (num_patches, w)
+            target = feat[:, idx]  # (N, num_patches, w)
+            self.patches.append(target.astype(np.int32))
+
+            # --- decoder input patches: sliding window on left-padded feat ---
+            padded = np.pad(feat, ((0, 0), (w - 1, 0)), mode='constant')  # (N, w-1+T)
+            dec = padded[:, idx]  # same index offsets work because padding shifts by w-1
+            self.decoder_patches.append(dec.astype(np.int32))
+
+            # --- teacher tokens ---
+            t_idx = np.maximum(np.arange(num_patches) - 1, 0)  # [0, 0, 1, 2, ...]
+            teacher = feat[:, t_idx]  # (N, num_patches)
+            self.teacher_tokens.append(teacher.astype(np.int32))
+
+        # --- patch mask (shared across channels) ---
+        # patch_mask[i, t, j] = True  iff  t + j >= case_lens[i]
+        positions = (np.arange(num_patches)[:, None] + np.arange(w)[None, :])  # (num_patches, w)
+        # Broadcast: (N, 1, 1) vs (1, num_patches, w)
+        self.patch_mask = (positions[None, :, :] >= self.case_lens[:, None, None]).astype(np.bool_)
+
     @property
     def onehot_train_targets(self):
         """
