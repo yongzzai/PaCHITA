@@ -1,0 +1,25 @@
+[project]
+name = "process-mining"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.7.0",
+    "gensim>=4.4.0",
+    "pandas>=3.0.1",
+    "pm4py>=2.7.19.8",
+    "ray>=2.54.0",
+    "scikit-learn>=1.8.0",
+    "torch>=2.10.0",
+    "torch-geometric>=2.7.0",
+    "untangle>=1.2.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
