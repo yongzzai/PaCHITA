@@ -4,21 +4,17 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
-    def __init__(self,
-                 d_model: int,
-                 eps: float = 1e-5):
+    def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model))
 
-
     def forward(self, x):
-        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
-        return output
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 
 class PatchEmbedding(nn.Module):
@@ -26,44 +22,30 @@ class PatchEmbedding(nn.Module):
 
     Input:  (batch, num_patches, w) LongTensor of token indices
     Output: (batch, num_patches, d_model)
+
+    Within-patch positional information is implicitly captured by flatten+linear
+    (each token position occupies a fixed slot in the flattened vector).
+    Patch-level positional encoding is added via learnable embeddings.
     """
 
-    def __init__(self, vocab_size: int, d_emb: int, d_model: int, window_size: int):
+    def __init__(self, vocab_size: int, d_emb: int, d_model: int, window_size: int, max_patches: int):
         super().__init__()
         self.window_size = window_size
         self.d_emb = d_emb
 
-        # Token embedding with padding_idx=0 (zero vector for padding)
         self.token_emb = nn.Embedding(vocab_size + 1, d_emb, padding_idx=0)
-        # Learnable within-patch positional encoding for positions 0..w-1
-        self.pos_emb = nn.Embedding(window_size, d_emb)
-        # RMSNorm applied on last dimension
         self.norm = RMSNorm(d_emb)
-        # Projection from flattened (w * d_emb) to d_model
-        self.proj = nn.Linear(window_size * d_emb, d_model)
+        self.proj = nn.Linear(window_size * d_emb, d_model, bias=False)
+        self.patch_pos_emb = nn.Embedding(max_patches, d_model)
 
     def forward(self, x):
         # x: (batch, num_patches, w)
         batch, num_patches, w = x.shape
-
-        # Token embedding: (batch, num_patches, w, d_emb)
-        tok = self.token_emb(x)
-
-        # Positional embedding: (w,) -> (w, d_emb), broadcast to match
-        positions = torch.arange(w, device=x.device)
-        pos = self.pos_emb(positions)  # (w, d_emb)
-
-        # Add token + positional embeddings
-        out = tok + pos  # (batch, num_patches, w, d_emb)
-
-        # RMSNorm on last dimension
-        out = self.norm(out)  # (batch, num_patches, w, d_emb)
-
-        # Flatten last two dims and project
-        out = out.reshape(batch, num_patches, w * self.d_emb)  # (batch, num_patches, w * d_emb)
-        out = self.proj(out)  # (batch, num_patches, d_model)
-
-        return out
+        tok = self.token_emb(x)  # (batch, num_patches, w, d_emb)
+        out = self.norm(tok)  # (batch, num_patches, w, d_emb)
+        out = self.proj(out.reshape(batch, num_patches, w * self.d_emb))  # (batch, num_patches, d_model)
+        positions = torch.arange(num_patches, device=x.device)
+        return out + self.patch_pos_emb(positions)
 
 
 class ChannelEncoder(nn.Module):
@@ -73,32 +55,19 @@ class ChannelEncoder(nn.Module):
     Output: (batch, num_patches, d_model) encoded representations
     """
 
-    def __init__(self, d_model: int, nhead: int, num_layers: int, d_ff: int, max_patches: int):
+    def __init__(self, d_model: int, nhead: int, num_layers: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        # Learnable sequence-level positional embedding
-        self.pos_emb = nn.Embedding(max_patches, d_model)
-
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_ff,
-            batch_first=True,
+            dropout=dropout,
+            batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(self, x):
-        # x: (batch, num_patches, d_model)
-        num_patches = x.size(1)
-
-        # Add sequence-level positional embedding
-        positions = torch.arange(num_patches, device=x.device)
-        x = x + self.pos_emb(positions)  # (batch, num_patches, d_model)
-
-        # Transformer encoder
-        out = self.encoder(x)  # (batch, num_patches, d_model)
-
-        return out
+    def forward(self, x, padding_mask=None):
+        return self.encoder(x, src_key_padding_mask=padding_mask)
 
 
 class ChannelDecoderAct(nn.Module):
@@ -106,127 +75,128 @@ class ChannelDecoderAct(nn.Module):
 
     Input:  patch_emb      (batch, num_patches, d_model) — decoder input patch embeddings
             enc_output     (batch, num_patches, d_model) — encoder output C_act
-            teacher_tokens (batch, num_patches) — teacher forcing token indices
     Output: logits (batch, num_patches, w, vocab_size+1) — predictions for each position in patch
-            hc_act (batch, num_patches, d_model) — cross-attention outputs
+            hc_act (batch, num_patches, d_model) — cross-attention outputs (detached)
     """
 
-    def __init__(self, vocab_size: int, d_emb: int, d_model: int, nhead: int, d_gru: int, window_size: int):
+    def __init__(self, vocab_size: int, d_model: int,
+                 d_gru: int, window_size: int, num_dec_layers: int = 1,
+                 dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
-        self.d_emb = d_emb
         self.d_gru = d_gru
         self.window_size = window_size
         self.vocab_size = vocab_size
+        self.p = dropout
 
         # Cross-attention: Q=patch_emb, K/V=enc_output
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, 1, dropout=0.1, batch_first=True)
+        self.norm = RMSNorm(d_model)
 
-        # Teacher token embedding
-        self.teacher_emb = nn.Embedding(vocab_size + 1, d_emb, padding_idx=0)
+        # Projection: enc_output mean-pool → GRU initial hidden state
+        self.h0_proj = nn.Linear(d_model, d_gru, bias=False)
+        self.num_dec_layers = num_dec_layers
 
-        # GRU cell: input is cat[hc_act_t, teacher_emb_t]
-        self.gru_cell = nn.GRUCell(d_model + d_emb, d_gru)
+        self.gru = nn.GRU(d_model, d_gru, num_layers=num_dec_layers, batch_first=True, bias=False, dropout=self.p)
 
-        # Output head: project from d_gru to window_size * (vocab_size + 1)
-        self.output_head = nn.Linear(d_gru, window_size * (vocab_size + 1))
+        # Output head: input is cat[patch_emb, gru_out]
+        self.output_head = nn.Linear(d_model + d_gru, window_size * (vocab_size + 1), bias=False)
 
-    def forward(self, patch_emb, enc_output, teacher_tokens):
+    def forward(self, patch_emb, enc_output, padding_mask=None):
         # patch_emb:      (batch, num_patches, d_model)
         # enc_output:     (batch, num_patches, d_model)
-        # teacher_tokens: (batch, num_patches)
+        # padding_mask:   (batch, num_patches) True where patch is entirely padding
         batch, num_patches, _ = patch_emb.shape
 
+        # Causal mask: prevent attending to future encoder patches
+        causal_mask = torch.triu(torch.ones(num_patches, num_patches, device=patch_emb.device, dtype=torch.bool), diagonal=1)
+
         # Cross-attention over all steps at once
-        hc_act, _ = self.cross_attn(patch_emb, enc_output, enc_output)
-        # hc_act: (batch, num_patches, d_model)
+        hc_act, _ = self.cross_attn(patch_emb, enc_output, enc_output,
+                                    attn_mask=causal_mask,
+                                    key_padding_mask=padding_mask)
+        hc_act = self.norm(hc_act + patch_emb)  # residual + norm
+        context_act = hc_act.detach().clone()
 
-        # Teacher token embedding
-        t_emb = self.teacher_emb(teacher_tokens)  # (batch, num_patches, d_emb)
+        # GRU initial state from encoder output (masked mean-pool)
+        if padding_mask is not None:
+            valid = (~padding_mask).unsqueeze(-1).float()  # (batch, num_patches, 1)
+            h0 = self.h0_proj((enc_output * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1))
+        else:
+            h0 = self.h0_proj(enc_output.mean(dim=1))
+        h0 = h0.unsqueeze(0).expand(self.num_dec_layers, -1, -1).contiguous()  # (num_layers, batch, d_gru)
 
-        # Sequential GRU loop over num_patches steps
-        h = torch.zeros(batch, self.d_gru, device=patch_emb.device)  # initial hidden state
-        all_logits = []
+        # GRU over all steps: input is hc_act only
+        gru_output, _ = self.gru(hc_act, h0)  # (batch, num_patches, d_gru)
 
-        for t in range(num_patches):
-            # Concatenate cross-attention output and teacher embedding at step t
-            gru_input = torch.cat([hc_act[:, t, :], t_emb[:, t, :]], dim=-1)  # (batch, d_model + d_emb)
-            h = self.gru_cell(gru_input, h)  # (batch, d_gru)
+        head_input = torch.cat([F.dropout(patch_emb, p=self.p, training=self.training), gru_output], dim=-1)  # (batch, num_patches, d_model + d_gru)
+        logits = self.output_head(head_input)  # (batch, num_patches, w * (vocab_size + 1))
+        logits = logits.reshape(batch, num_patches, self.window_size, self.vocab_size + 1)
 
-            # Output head
-            out = self.output_head(h)  # (batch, window_size * (vocab_size + 1))
-            out = out.reshape(batch, self.window_size, self.vocab_size + 1)  # (batch, w, vocab_size+1)
-            all_logits.append(out)
-
-        # Stack all step outputs: (batch, num_patches, w, vocab_size+1)
-        logits = torch.stack(all_logits, dim=1)
-
-        return logits, hc_act
+        return logits, context_act
 
 
 class ChannelDecoderAttr(nn.Module):
     """Attribute channel decoder.
 
-    Same structure as ChannelDecoderAct but GRU input includes both the activity
-    cross-attention output (hc_act) and this channel's own cross-attention output.
-
     Input:  patch_emb      (batch, num_patches, d_model) — this channel's decoder input embeddings
             enc_output     (batch, num_patches, d_model) — this channel's encoder output
-            teacher_tokens (batch, num_patches) — teacher forcing tokens
-            hc_act         (batch, num_patches, d_model) — activity cross-attention outputs from DecoderAct
+            hc_act         (batch, num_patches, d_model) — activity cross-attention outputs (detached)
     Output: logits (batch, num_patches, w, vocab_size+1)
     """
 
-    def __init__(self, vocab_size: int, d_emb: int, d_model: int, nhead: int, d_gru: int, window_size: int):
+    def __init__(self, vocab_size: int, d_model: int,
+                 d_gru: int, window_size: int, num_dec_layers: int = 1,
+                 dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
-        self.d_emb = d_emb
         self.d_gru = d_gru
         self.window_size = window_size
         self.vocab_size = vocab_size
+        self.p = dropout
 
-        # Cross-attention: Q=patch_emb, K/V=enc_output
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, 1, dropout=0.1, batch_first=True)
+        self.norm = RMSNorm(d_model)
 
-        # Teacher token embedding
-        self.teacher_emb = nn.Embedding(vocab_size + 1, d_emb, padding_idx=0)
+        self.h0_proj = nn.Linear(d_model, d_gru, bias=False)
+        self.num_dec_layers = num_dec_layers
 
-        # GRU cell: input is cat[hc_act_t, hc_attr_t, teacher_emb_t]
-        self.gru_cell = nn.GRUCell(2 * d_model + d_emb, d_gru)
+        # GRU: input is cat[hc_attr, hc_act]
+        self.gru = nn.GRU(2 * d_model, d_gru, num_layers=num_dec_layers, batch_first=True, bias=False, dropout=self.p)
+        
+        # Output head: input is cat[gru_out, patch_emb, hc_act]
+        self.output_head = nn.Linear(d_gru + d_model + d_model, window_size * (vocab_size + 1), bias=False)
 
-        # Output head
-        self.output_head = nn.Linear(d_gru, window_size * (vocab_size + 1))
-
-    def forward(self, patch_emb, enc_output, teacher_tokens, hc_act):
+    def forward(self, patch_emb, enc_output, hc_act, padding_mask=None):
         # patch_emb:      (batch, num_patches, d_model)
         # enc_output:     (batch, num_patches, d_model)
-        # teacher_tokens: (batch, num_patches)
         # hc_act:         (batch, num_patches, d_model)
+        # padding_mask:   (batch, num_patches) True where patch is entirely padding
         batch, num_patches, _ = patch_emb.shape
 
+        # Causal mask: prevent attending to future encoder patches
+        causal_mask = torch.triu(torch.ones(num_patches, num_patches, device=patch_emb.device, dtype=torch.bool), diagonal=1)
+
         # Cross-attention over all steps at once
-        hc_attr, _ = self.cross_attn(patch_emb, enc_output, enc_output)
-        # hc_attr: (batch, num_patches, d_model)
+        hc_attr, _ = self.cross_attn(patch_emb, enc_output, enc_output,
+                                     attn_mask=causal_mask,
+                                     key_padding_mask=padding_mask)
+        hc_attr = self.norm(hc_attr + patch_emb)  # residual + norm
 
-        # Teacher token embedding
-        t_emb = self.teacher_emb(teacher_tokens)  # (batch, num_patches, d_emb)
+        # GRU initial state from encoder output (masked mean-pool)
+        if padding_mask is not None:
+            valid = (~padding_mask).unsqueeze(-1).float()  # (batch, num_patches, 1)
+            h0 = self.h0_proj((enc_output * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1))
+        else:
+            h0 = self.h0_proj(enc_output.mean(dim=1))
+        h0 = h0.unsqueeze(0).expand(self.num_dec_layers, -1, -1).contiguous()  # (num_layers, batch, d_gru)
 
-        # Sequential GRU loop over num_patches steps
-        h = torch.zeros(batch, self.d_gru, device=patch_emb.device)  # initial hidden state
-        all_logits = []
+        # GRU over all steps: input is cat[hc_attr, hc_act]
+        gru_input = torch.cat([hc_attr, hc_act], dim=-1)  # (batch, num_patches, 2*d_model)
+        gru_output, _ = self.gru(gru_input, h0)  # (batch, num_patches, d_gru)
 
-        for t in range(num_patches):
-            # Concatenate activity cross-attn, this channel's cross-attn, and teacher embedding
-            gru_input = torch.cat([hc_act[:, t, :], hc_attr[:, t, :], t_emb[:, t, :]], dim=-1)
-            # (batch, 2 * d_model + d_emb)
-            h = self.gru_cell(gru_input, h)  # (batch, d_gru)
-
-            # Output head
-            out = self.output_head(h)  # (batch, window_size * (vocab_size + 1))
-            out = out.reshape(batch, self.window_size, self.vocab_size + 1)  # (batch, w, vocab_size+1)
-            all_logits.append(out)
-
-        # Stack all step outputs: (batch, num_patches, w, vocab_size+1)
-        logits = torch.stack(all_logits, dim=1)
+        head_input = torch.cat([F.dropout(patch_emb, p=self.p, training=self.training), hc_act, gru_output], dim=-1)
+        logits = self.output_head(head_input)  # (batch, num_patches, w * (vocab_size + 1))
+        logits = logits.reshape(batch, num_patches, self.window_size, self.vocab_size + 1)
 
         return logits
