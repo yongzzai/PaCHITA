@@ -1,16 +1,19 @@
+'''
+For baseline methods, Check out https://github.com/guanwei49/BPAD
+Guan, Wei, et al. "Survey and benchmark of anomaly detection in business processes." IEEE Transactions on Knowledge and Data Engineering 37.1 (2024): 493-512.
+'''
+
 import argparse
 import os
 import traceback
 import time
-from multiprocessing import Process
-import multiprocessing
 
 import pandas as pd
 
 from warnings import filterwarnings
 filterwarnings("ignore")
 
-from model.model import PatchBPAD
+from model.model import PaCHITA
 from utils.dataset import Dataset
 from utils.eval import cal_best_PRF
 from utils.fs import EVENTLOG_DIR, ROOT_DIR
@@ -27,6 +30,8 @@ def fit_and_eva(dataset_name, ad, fit_kwargs=None, ad_kwargs=None):
     print(dataset_name)
     dataset = Dataset(dataset_name)
 
+    ad_kwargs = dict(ad_kwargs)
+    ad_kwargs['batch_size'] = 16 if dataset.num_cases <= 5000 else 64
     ad = ad(**ad_kwargs)
     print(ad.name)
     resPath = os.path.join(ROOT_DIR, f'results/result_{ad.name}.csv')
@@ -87,7 +92,7 @@ def fit_and_eva(dataset_name, ad, fit_kwargs=None, ad_kwargs=None):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='PatchBPAD: Patch-based Business Process Anomaly Detection')
+    parser = argparse.ArgumentParser(description='PaCHITA: Patch-based Business Process Anomaly Detection')
 
     # Dataset
     parser.add_argument('-d', '--datasets', nargs='+', default=None,
@@ -115,7 +120,6 @@ def parse_args():
 
 
 if __name__ == '__main__':
-    multiprocessing.set_start_method('spawn')
     args = parse_args()
 
     if args.datasets:
@@ -127,24 +131,15 @@ if __name__ == '__main__':
             dataset_names.remove('cache')
 
     ad_kwargs = dict(
-        window_size=args.window_size,
-        d_emb=args.d_emb,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_enc_layers=args.num_enc_layers,
-        num_dec_layers=args.num_dec_layers,
-        d_ff=args.d_ff,
-        d_gru=args.d_gru,
-        enc_dropout=args.enc_dropout,
-        dec_dropout=args.dec_dropout,
-        n_epochs=args.n_epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-    )
+        window_size=args.window_size, d_emb=args.d_emb,
+        d_model=args.d_model, nhead=args.nhead,
+        num_enc_layers=args.num_enc_layers, num_dec_layers=args.num_dec_layers,
+        d_ff=args.d_ff, d_gru=args.d_gru,
+        enc_dropout=args.enc_dropout, dec_dropout=args.dec_dropout,
+        n_epochs=args.n_epochs, batch_size=args.batch_size,
+        lr=args.lr, seed=args.seed)
 
     print('number of datasets:' + str(len(dataset_names)))
     for d in dataset_names:
-        p = Process(target=fit_and_eva, kwargs={'dataset_name': d, 'ad': PatchBPAD, 'ad_kwargs': ad_kwargs})
-        p.start()
-        p.join()
+        for _ in range(3):
+            fit_and_eva(dataset_name=d, ad=PaCHITA, ad_kwargs=ad_kwargs)

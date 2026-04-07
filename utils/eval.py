@@ -4,7 +4,6 @@ from sklearn.metrics import precision_recall_curve, average_precision_score
 
 def cal_best_PRF(y_true,probas_pred):
     '''
-    计算在任何阈值下，最好的precision，recall。f1
     :param y_true:
     :param probas_pred:
     :return:

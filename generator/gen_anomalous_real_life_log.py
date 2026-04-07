@@ -11,7 +11,7 @@ from processmining.log import EventLog
 from utils.fs import EVENTLOG_DIR
 
 np.random.seed(0)  # This will ensure reproducibility
-ps = [0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45]
+ps = [0.1]
 
 def get_log_files(path=None):
     # Base
@@ -23,6 +23,7 @@ def get_log_files(path=None):
 
 
 logs = [m for m in get_log_files()]
+logs = [name for name in logs if 'BPIC20' in name or 'Receipt' in name]
 combinations = list(itertools.product(logs, ps))
 for event_log_path, p in tqdm(combinations, desc='Add anomalies'):
     print(event_log_path)

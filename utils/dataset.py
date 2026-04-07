@@ -46,7 +46,7 @@ def to_categorical(y, num_classes=None, dtype='float32'):
     return categorical
 
 class Dataset(object):
-    def __init__(self, dataset_name=None, beta=0, label_percent = 0):
+    def __init__(self, dataset_name=None, beta=0):
         # Public properties
         self.dataset_name = dataset_name
         self.beta=beta   #used by GAMA
@@ -60,7 +60,6 @@ class Dataset(object):
         self.node_dims=[]
         self.edge_indexs = []
         self.node_xs = []
-        self.label_percent = label_percent   # Used by weakly supervised methods to control the percentage of anomalies labeled during training
 
         # Private properties
         self._mask = None
@@ -162,7 +161,7 @@ class Dataset(object):
         dims_range = [(dims_temp[i - 1], dims_temp[i]) for i in range(1, len(dims_temp))]
 
         onehot_features = self.flat_onehot_features
-        for case_index in range(self.num_cases):  #生成图
+        for case_index in range(self.num_cases):
             edge = []
             xs = []
             edge_attr = None
@@ -201,7 +200,7 @@ class Dataset(object):
                     Data(torch.tensor(np.array(node), dtype=torch.float), edge_index=edge_index.T, edge_attr=edge_attr))
 
     def _gen_patches(self, window_size):
-        """Precompute sliding-window patches (stride=1) for PatchBPAD.
+        """Precompute sliding-window patches (stride=1) for PaCHITA.
 
         Stores on *self*:
             window_size      – the window (patch) width w
@@ -426,8 +425,6 @@ class Dataset(object):
         return [to_categorical(f)[:, :, 1:] if t == AttributeType.CATEGORICAL else np.expand_dims(f, axis=2)
                 for f, t in zip(self._features, self.attribute_types)]
 
-
-
     @property
     def flat_onehot_features(self):
         """
@@ -442,7 +439,7 @@ class Dataset(object):
 
     @staticmethod
     def remove_time_dimension(x):
-        return x.reshape((x.shape[0], np.product(x.shape[1:])))
+        return x.reshape((x.shape[0], np.prod(x.shape[1:])))
 
     @property
     def flat_features_2d(self):
