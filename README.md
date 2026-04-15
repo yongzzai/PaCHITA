@@ -65,6 +65,6 @@ Metrics: Precision, Recall, F1-score (best threshold), and Average Precision (AU
 
 ## Acknowledgments
 
-The event log generation framework and baseline implementations are adapted from [BPAD](https://github.com/guanwei49/BPAD) (Timo Nolle, GPL-3.0).
+The event log generation framework and baseline implementations are adapted from [BPAD](https://github.com/guanwei49/BPAD) (Guan et al., 2025).
 
 <img src="assets/Devil_of_A.jpg" width="200">
